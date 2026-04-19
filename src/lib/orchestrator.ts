@@ -147,6 +147,16 @@ export async function runVisualOrchestrator(opts: VisualOrchestratorOptions) {
   let fullResponse = ''
   let hasAnyBlock = false
 
+  // Track incomplete visual blocks for continuation
+  interface IncompleteVisual {
+    blockId: string
+    visualType: string
+    partialContent: string
+  }
+  let incompleteVisual: IncompleteVisual | null = null
+  let lastVisualBlockId = ''
+  let lastVisualType = ''
+
   parser.on((event) => {
     switch (event.type) {
       case 'think_chunk':
@@ -171,23 +181,35 @@ export async function runVisualOrchestrator(opts: VisualOrchestratorOptions) {
 
       case 'visual_start':
         blockCounter++
-        emit('block.visual_start', { blockId: `b${blockCounter}`, visualType: event.payload.visualType })
+        lastVisualBlockId = `b${blockCounter}`
+        lastVisualType = String(event.payload.visualType ?? 'html')
+        emit('block.visual_start', { blockId: lastVisualBlockId, visualType: lastVisualType })
         hasAnyBlock = true
+        incompleteVisual = null  // reset
         break
       case 'visual_end':
         if (event.payload.isComplete) {
           emit('block.visual', {
-            blockId: `b${blockCounter}`,
+            blockId: lastVisualBlockId,
             visualType: event.payload.visualType,
             content: event.payload.content,
           })
+          incompleteVisual = null
+        } else {
+          // Stream ended before </visual> — save partial for continuation
+          incompleteVisual = {
+            blockId: lastVisualBlockId,
+            visualType: lastVisualType,
+            partialContent: String(event.payload.content ?? ''),
+          }
         }
         break
     }
   })
 
+  let finishReason: 'stop' | 'length' | null = null
   try {
-    await streamCall({
+    const result = await streamCall({
       messages,
       maxTokens: projectConfig.llm.maxTokens,
       temperature: projectConfig.llm.temperature,
@@ -197,6 +219,7 @@ export async function runVisualOrchestrator(opts: VisualOrchestratorOptions) {
         parser.push(text)
       },
     })
+    finishReason = result.finishReason
   } catch (err: unknown) {
     const name = (err as Error)?.name
     if (name === 'AbortError' || signal?.aborted) {
@@ -210,6 +233,100 @@ export async function runVisualOrchestrator(opts: VisualOrchestratorOptions) {
   }
 
   parser.end()
+
+  // ── 3b. Continuation: if truncated, keep completing the visual ───────────
+  const MAX_CONTINUATIONS = 3
+  let continuationCount = 0
+
+  while (
+    finishReason === 'length' &&
+    incompleteVisual !== null &&
+    !signal?.aborted &&
+    continuationCount < MAX_CONTINUATIONS
+  ) {
+    continuationCount++
+    // snapshot so TypeScript knows it's non-null inside this iteration
+    const snap = incompleteVisual as IncompleteVisual
+    emit('status', { message: `补全中… (${continuationCount}/${MAX_CONTINUATIONS})` })
+
+    const contMessages: Message[] = [
+      ...messages,
+      { role: 'assistant', content: fullResponse },
+      {
+        role: 'user',
+        content: '[CONTINUE] Continue generating exactly from where you stopped. ' +
+          'Do NOT repeat content. Do NOT add any preamble. ' +
+          'Just continue the code from the exact cutoff point.',
+      },
+    ]
+
+    incompleteVisual = null   // reset before next parse
+    finishReason = null
+
+    const contParser = new VisualStreamParser()
+    let contVisualContent = ''
+
+    contParser.on((event) => {
+      switch (event.type) {
+        case 'text_chunk':
+          contVisualContent += String(event.payload.text ?? '')
+          break
+        case 'visual_end':
+          if (event.payload.isComplete) {
+            contVisualContent += String(event.payload.content ?? '')
+          } else {
+            incompleteVisual = {
+              blockId: snap.blockId,
+              visualType: snap.visualType,
+              partialContent: snap.partialContent + contVisualContent + String(event.payload.content ?? ''),
+            }
+          }
+          break
+        case 'visual_start':
+          break
+      }
+    })
+
+    try {
+      const contResult = await streamCall({
+        messages: contMessages,
+        maxTokens: projectConfig.llm.maxTokens,
+        temperature: 0,
+        signal,
+        onChunk: (text) => {
+          fullResponse += text
+          contParser.push(text)
+        },
+      })
+      finishReason = contResult.finishReason
+    } catch {
+      break
+    }
+
+    contParser.end()
+
+    const mergedContent = snap.partialContent + contVisualContent
+
+    if (incompleteVisual === null) {
+      emit('block.visual', {
+        blockId: snap.blockId,
+        visualType: snap.visualType,
+        content: mergedContent,
+      })
+    } else {
+      ;(incompleteVisual as IncompleteVisual).partialContent = mergedContent
+    }
+  }
+
+  // Hit max continuations — emit whatever we have so the user sees something
+  if (incompleteVisual !== null) {
+    const iv = incompleteVisual as IncompleteVisual
+    emit('block.visual', {
+      blockId: iv.blockId,
+      visualType: iv.visualType,
+      content: iv.partialContent,
+    })
+  }
 
   // ── 4. Safety net ────────────────────────────────────────────────────────
   if (!hasAnyBlock && fullResponse.trim()) {
