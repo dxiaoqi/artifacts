@@ -25,81 +25,74 @@ let splitBlockCounter = 0
  * Both are promoted to proper visual blocks so the user sees a rendered component.
  */
 function extractEmbeddedVisuals(blocks: ContentBlock[]): ContentBlock[] {
+  const FENCE_RE = /```(html?|svg|threejs|javascript|js)\s*\n([\s\S]*?)(?:```|$)/gi
+
   const result: ContentBlock[] = []
   for (const block of blocks) {
     if (block.kind !== 'text') { result.push(block); continue }
 
     const content = block.content
-    // Fast path: no <visual in this block
-    if (!content.includes('<visual')) { result.push(block); continue }
+    const hasVisual = content.includes('<visual')
+    const hasFence = content.includes('```')
 
+    // Fast path: nothing to extract
+    if (!hasVisual && !hasFence) { result.push(block); continue }
+
+    // ── 1. Extract <visual type="...">…</visual> tags ──────────────────────
     let remaining = content
     let changed = false
 
-    while (remaining.length > 0) {
-      const vStart = remaining.indexOf('<visual')
-      if (vStart === -1) break
-
-      const gtIdx = remaining.indexOf('>', vStart)
-      if (gtIdx === -1) break
-
-      const tagContent = remaining.slice(vStart, gtIdx + 1)
-      const typeMatch = tagContent.match(/type\s*=\s*['"]([^'"]+)['"]/)
-      if (!typeMatch) { break }
-
-      const visualType = typeMatch[1]
-      const closeTag = '</visual>'
-      const vEnd = remaining.indexOf(closeTag, gtIdx)
-      if (vEnd === -1) break
-
-      // Text before the visual
-      const beforeText = remaining.slice(0, vStart)
-      if (beforeText) {
-        result.push({ kind: 'text', id: `split_${++splitBlockCounter}`, content: beforeText, isStreaming: false })
+    if (hasVisual) {
+      while (remaining.length > 0) {
+        const vStart = remaining.indexOf('<visual')
+        if (vStart === -1) break
+        const gtIdx = remaining.indexOf('>', vStart)
+        if (gtIdx === -1) break
+        const tagContent = remaining.slice(vStart, gtIdx + 1)
+        const typeMatch = tagContent.match(/type\s*=\s*['"]([^'"]+)['"]/)
+        if (!typeMatch) break
+        const visualType = typeMatch[1]
+        const closeTag = '</visual>'
+        const vEnd = remaining.indexOf(closeTag, gtIdx)
+        if (vEnd === -1) break
+        const beforeText = remaining.slice(0, vStart)
+        if (beforeText) result.push({ kind: 'text', id: `split_${++splitBlockCounter}`, content: beforeText, isStreaming: false })
+        const visualContent = remaining.slice(gtIdx + 1, vEnd).trim()
+        const safeType = (['svg', 'html', 'threejs'].includes(visualType) ? visualType : 'html') as import('@/lib/types').VisualBlockType
+        result.push({ kind: 'visual', id: `split_${++splitBlockCounter}`, visualType: safeType, content: visualContent, isComplete: true })
+        remaining = remaining.slice(vEnd + closeTag.length)
+        changed = true
       }
-
-      // The visual block itself
-      const visualContent = remaining.slice(gtIdx + 1, vEnd).trim()
-      const safeType = (['svg', 'html', 'threejs'].includes(visualType) ? visualType : 'html') as import('@/lib/types').VisualBlockType
-      result.push({
-        kind: 'visual',
-        id: `split_${++splitBlockCounter}`,
-        visualType: safeType,
-        content: visualContent,
-        isComplete: true,
-      })
-
-      remaining = remaining.slice(vEnd + closeTag.length)
-      changed = true
+      if (remaining && changed) {
+        result.push({ kind: 'text', id: `split_${++splitBlockCounter}`, content: remaining, isStreaming: false })
+        continue
+      }
     }
 
-    // If no <visual> tags found, also check for markdown code fences (```html/svg/threejs)
-    if (!changed) {
-      const fenceRe = /^```(html?|svg|threejs|javascript|js)\s*\n([\s\S]*?)(?:^```\s*$|$)/im
+    // ── 2. Extract ```html/svg/threejs fences (model compliance fallback) ──
+    if (!changed && hasFence) {
+      FENCE_RE.lastIndex = 0
       let fenceChanged = false
-      let fenceRemaining = content
-      while (fenceRemaining.length > 0) {
-        const m = fenceRe.exec(fenceRemaining)
-        if (!m) break
+      let fenceRemaining = remaining
+      let m: RegExpExecArray | null
+      while ((m = FENCE_RE.exec(fenceRemaining)) !== null) {
         const lang = m[1].toLowerCase()
         const code = m[2].trim()
         const vt = (lang === 'svg' ? 'svg' : lang === 'threejs' ? 'threejs' : 'html') as import('@/lib/types').VisualBlockType
         const before = fenceRemaining.slice(0, m.index).trim()
         if (before) result.push({ kind: 'text', id: `split_${++splitBlockCounter}`, content: before, isStreaming: false })
         result.push({ kind: 'visual', id: `split_${++splitBlockCounter}`, visualType: vt, content: code, isComplete: true })
-        fenceRemaining = fenceRemaining.slice(m.index + m[0].length).trim()
+        fenceRemaining = fenceRemaining.slice(m.index + m[0].length)
+        FENCE_RE.lastIndex = 0  // reset for next search on sliced string
         fenceChanged = true
       }
       if (fenceChanged) {
-        if (fenceRemaining) result.push({ kind: 'text', id: `split_${++splitBlockCounter}`, content: fenceRemaining, isStreaming: false })
-      } else {
-        result.push(block)
+        if (fenceRemaining.trim()) result.push({ kind: 'text', id: `split_${++splitBlockCounter}`, content: fenceRemaining.trim(), isStreaming: false })
+        continue
       }
-      continue
     }
-    if (remaining) {
-      result.push({ kind: 'text', id: `split_${++splitBlockCounter}`, content: remaining, isStreaming: false })
-    }
+
+    result.push(block)
   }
   return result
 }
