@@ -10,10 +10,13 @@
 
 ## SVG 颜色使用
 
-- 节点背景：主色 + `opacity="0.15"` 作填充，主色作描边
-- 连接线：`#94a3b8`，宽度 1.5-2px
-- 文字：`#1e293b`（深色背景上用 white）
-- 强调：`#6366f1`
+- **节点**：使用 `.c-blue` `.c-purple` 等 CSS 类，`rect`/`circle` 不手动设 `fill`/`stroke`
+- **容器背景**（大框套小框）：`fill="[主色]" fill-opacity="0.06" stroke="[主色]" stroke-opacity="0.2" stroke-width="0.5"`
+- **连接线**：`stroke="#94a3b8" stroke-width="1.5"`，箭头用 `class="arr" marker-end="url(#arrow)"`
+- **文字**：节点内用 `class="th"`/`class="ts"`，不设 `fill`（由 CSS 类决定）
+- **强调线/标注**：`stroke="#6366f1" stroke-dasharray="4,3"`
+
+> 不要用 `#0f172a`、`#1e293b` 等深色作为节点的 `fill`，会渲染成黑色。
 
 ## HTML Widget 样式
 

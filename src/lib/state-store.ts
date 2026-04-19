@@ -104,6 +104,35 @@ class StateStore {
     }
   }
 
+  setAssistantReply(turnId: string, reply: string) {
+    const t = this.turns.get(turnId)
+    if (t) (t as Turn & { assistantReply?: string }).assistantReply = reply
+  }
+
+  getRecentHistory(conversationId: string, maxTurns = 6): Array<{ role: 'user' | 'assistant', content: string }> {
+    const turns = this.listTurns(conversationId).slice(-maxTurns)
+    const messages: Array<{ role: 'user' | 'assistant', content: string }> = []
+    for (const turn of turns) {
+      messages.push({ role: 'user', content: turn.userInput })
+      if (turn.artifactId) {
+        const artifact = this.artifacts.get(turn.artifactId)
+        if (artifact && artifact.status === 'ready') {
+          const t = turn as Turn & { assistantReply?: string }
+          if (artifact.widgets.length > 0) {
+            const widgetSummary = artifact.widgets.map(w => `[${w.type}] ${w.title || ''}`.trim()).join(', ')
+            messages.push({ role: 'assistant', content: `[已产出 artifact: ${widgetSummary}]` })
+          } else if (t.assistantReply) {
+            const preview = t.assistantReply.length > 300
+              ? t.assistantReply.slice(0, 300) + '…'
+              : t.assistantReply
+            messages.push({ role: 'assistant', content: preview })
+          }
+        }
+      }
+    }
+    return messages
+  }
+
   listTurns(conversationId: string): Turn[] {
     return Array.from(this.turns.values())
       .filter(t => t.conversationId === conversationId)
@@ -175,25 +204,6 @@ class StateStore {
     return this.artifacts.get(artifactId)?.widgets ?? []
   }
 
-  // ─── Conversation history for prompts ────────────────────────────────────
-
-  getRecentHistory(conversationId: string, maxTurns = 6): Array<{ role: 'user' | 'assistant', content: string }> {
-    const turns = this.listTurns(conversationId).slice(-maxTurns)
-    const messages: Array<{ role: 'user' | 'assistant', content: string }> = []
-    for (const turn of turns) {
-      messages.push({ role: 'user', content: turn.userInput })
-      if (turn.artifactId) {
-        const artifact = this.artifacts.get(turn.artifactId)
-        if (artifact && artifact.status === 'ready') {
-          const widgetSummary = artifact.widgets
-            .map(w => `[${w.type}:${w.id}] ${w.title || ''}`)
-            .join(', ')
-          messages.push({ role: 'assistant', content: `[已产出 artifact: ${widgetSummary}]` })
-        }
-      }
-    }
-    return messages
-  }
 }
 
 // Singleton

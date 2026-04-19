@@ -1,3 +1,24 @@
+// ─── Visual block types ──────────────────────────────────────────────────────
+
+export type VisualBlockType = 'svg' | 'html' | 'threejs'
+
+export interface TextContentBlock {
+  kind: 'text'
+  id: string
+  content: string
+  isStreaming: boolean
+}
+
+export interface VisualContentBlock {
+  kind: 'visual'
+  id: string
+  visualType: VisualBlockType
+  content: string
+  isComplete: boolean
+}
+
+export type ContentBlock = TextContentBlock | VisualContentBlock
+
 // ─── Protocol types ───────────────────────────────────────────────────────────
 
 export type WidgetType = 'markdown' | 'svg' | 'html' | 'chart' | string
@@ -188,6 +209,16 @@ export type DisplayEventType =
   | 'status'
   /** 用于纯对话回复（无 plan/widget 的响应）*/
   | 'conversational.reply'
+  /** Tool call indicators */
+  | 'tool.start'
+  | 'tool.done'
+  /** Visual system events */
+  | 'block.text_start'   // new text block begins (streaming)
+  | 'block.text_chunk'   // text content appended
+  | 'block.text_end'     // text block complete
+  | 'block.visual_start' // visual block skeleton shown
+  | 'block.visual'       // visual block complete (type + content)
+  | 'stream.completed'   // all blocks committed
 
 export interface DisplayEvent {
   type: DisplayEventType

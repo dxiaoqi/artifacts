@@ -64,3 +64,33 @@ export async function callOnce(messages: Message[], maxTokens = 200): Promise<st
   })
   return res.choices[0]?.message?.content ?? ''
 }
+
+/**
+ * 结构化调用 — JSON mode + Zod 验证
+ */
+export async function callStructured<T extends import('zod').ZodTypeAny>(
+  messages: Message[],
+  schema: T,
+  opts: { system?: string; maxTokens?: number; fallback?: import('zod').infer<T> } = {},
+): Promise<import('zod').infer<T>> {
+  const { system, maxTokens = 200, fallback } = opts
+  const allMessages: Message[] = system
+    ? [{ role: 'system', content: system + '\nRespond with a valid JSON object only.' }, ...messages]
+    : messages
+
+  let raw = ''
+  try {
+    raw = await callOnce(allMessages, maxTokens)
+  } catch { if (fallback !== undefined) return fallback; throw new Error('callStructured failed') }
+
+  let parsed: unknown
+  try { parsed = JSON.parse(raw.trim()) } catch {
+    const m = raw.match(/\{[\s\S]*\}/)
+    try { parsed = m ? JSON.parse(m[0]) : {} } catch { parsed = {} }
+  }
+
+  const result = schema.safeParse(parsed)
+  if (result.success) return result.data
+  if (fallback !== undefined) return fallback
+  throw new Error(`Schema validation failed: ${result.error.message}`)
+}

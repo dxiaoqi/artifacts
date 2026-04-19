@@ -5,7 +5,7 @@
 
 import { NextRequest } from 'next/server'
 import { stateStore } from '@/lib/state-store'
-import { runOrchestrator } from '@/lib/orchestrator'
+import { runVisualOrchestrator } from '@/lib/orchestrator'
 import type { DisplayEvent } from '@/lib/types'
 
 export const dynamic = 'force-dynamic'
@@ -62,7 +62,7 @@ export async function POST(req: NextRequest) {
       })
 
       try {
-        await runOrchestrator({
+        await runVisualOrchestrator({
           conversationId: conversation!.id,
           turnId: turn.id,
           artifactId: artifact.id,

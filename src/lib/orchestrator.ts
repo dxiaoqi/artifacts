@@ -1,17 +1,227 @@
 /**
  * Orchestrator — 核心编排层
- * IntentFunnel → Plan → PhaseLoop → Critic → Replan
+ * V1 (legacy): plan/phase/widget protocol
+ * V2 (visual):  text/visual block protocol  ← active
  */
 
 import type {
   Plan, Phase, Dimensions, Criterion, WidgetSnapshot,
   DisplayEvent, PhaseOutcome,
 } from './types'
-import { streamCall, callOnce, type Message } from './llm-client'
+import { streamCall, callOnce, callStructured, type Message } from './llm-client'
+import { RouterDecisionSchema } from './tools'
+import { VisualStreamParser } from './visual-stream-parser'
 import { StreamParser } from './stream-parser'
+import { buildVisualSystemPrompt } from './skill-loader'
 import { buildSystemPrompt } from './skill-loader'
 import { stateStore } from './state-store'
 import { runCritic } from './critic'
+import { artifactsDefaultEnabled, projectConfig } from './config'
+
+// ─── Trivial input check (shared by both orchestrators) ──────────────────────
+
+function isTrivialInput(input: string): boolean {
+  const t = input.trim()
+  if (t.replace(/[\s\W]/g, '').length < 4) return true
+  if (/^[?？!！.。…,，、~～\s]+$/.test(t)) return true
+  if (/^(hi|hello|hey|你好|在吗|早上好|嗨)[\s!！。~]*$/i.test(t)) return true
+  if (/^(嗯+|好的|收到|谢谢|ok|哦)[\s!！。]*$/i.test(t)) return true
+  return false
+}
+
+// ─── Conversational reply helper (shared) ────────────────────────────────────
+
+const CONVERSATIONAL_SYSTEM =
+  '你是一个友好的 AI 助手。用自然语言直接回复用户，语气匹配用户的调性。\n' +
+  '禁止输出任何 XML 标签（<plan>、<widget>、<text>、<visual> 等）。'
+
+async function runConversationalReply(
+  conversationId: string,
+  turnId: string,
+  artifactId: string,
+  userInput: string,
+  signal: AbortSignal | undefined,
+  emit: (type: import('./types').DisplayEvent['type'], payload?: Record<string, unknown>) => void,
+  systemOverride?: string,
+) {
+  const history = stateStore.getRecentHistory(conversationId, 4)
+  let reply = ''
+  try {
+    await streamCall({
+      messages: [
+        { role: 'system', content: systemOverride ?? CONVERSATIONAL_SYSTEM },
+        ...history,
+        { role: 'user', content: userInput },
+      ],
+      maxTokens: 600,
+      temperature: 0.8,
+      signal,
+      onChunk: (text) => {
+        reply += text
+        emit('conversational.reply', { text, done: false })
+      },
+    })
+  } catch {
+    const fallback = '抱歉，我暂时没法回复，请稍后再试。'
+    emit('conversational.reply', { text: fallback, done: false })
+    reply = fallback
+  }
+  if (reply) stateStore.setAssistantReply(turnId, reply)
+  emit('conversational.reply', { text: '', done: true, full: reply })
+  stateStore.updateTurnStatus(turnId, 'completed', artifactId)
+}
+
+// ─── Visual Orchestrator (V2) ────────────────────────────────────────────────
+
+export interface VisualOrchestratorOptions {
+  conversationId: string
+  turnId: string
+  artifactId: string
+  userInput: string
+  signal?: AbortSignal
+  onEvent: (event: DisplayEvent) => void
+}
+
+export async function runVisualOrchestrator(opts: VisualOrchestratorOptions) {
+  const { conversationId, turnId, artifactId, userInput, signal, onEvent } = opts
+
+  const emit = (type: DisplayEvent['type'], payload: Record<string, unknown> = {}) => {
+    onEvent({ type, payload })
+  }
+
+  emit('status', { message: '正在思考…' })
+
+  // ── 0. Trivial gate ──────────────────────────────────────────────────────
+  if (isTrivialInput(userInput)) {
+    await runConversationalReply(conversationId, turnId, artifactId, userInput, signal, emit,
+      '你是一个友好的 AI 助手。用户发来的是打招呼或简短消息，直接用自然语言简短回复，不要输出任何 XML 标签。')
+    return
+  }
+
+  // ── 1. Routing decision ──────────────────────────────────────────────────
+  const history = stateStore.getRecentHistory(conversationId, 4)
+
+  if (!artifactsDefaultEnabled) {
+    const ROUTING_SYSTEM =
+      'Decide if the user needs a visual artifact or a conversational reply.\n' +
+      'mode="artifact": needs diagrams, interactive components, data charts, or structured visual content.\n' +
+      'mode="conversational": chat, opinions, open-ended learning, greetings.\n' +
+      'Respond ONLY with the JSON object.'
+    emit('tool.start', { tool: 'routing', description: '分析请求意图…' })
+    let routing: { mode: 'artifact' | 'conversational' }
+    try {
+      routing = await callStructured(
+        [...history, { role: 'user', content: userInput }],
+        RouterDecisionSchema,
+        { system: ROUTING_SYSTEM, maxTokens: projectConfig.llm.routingMaxTokens, fallback: { mode: 'artifact' } },
+      )
+    } catch { routing = { mode: 'artifact' } }
+    emit('tool.done', { tool: 'routing', result: routing.mode })
+    if (routing.mode === 'conversational') {
+      await runConversationalReply(conversationId, turnId, artifactId, userInput, signal, emit)
+      return
+    }
+  }
+
+  // ── 2. Build system prompt ───────────────────────────────────────────────
+  emit('status', { message: '正在生成…' })
+
+  const systemPrompt = buildVisualSystemPrompt() + (artifactsDefaultEnabled
+    ? '\n\n[CONFIG] Always generate visual content using <text>/<visual> protocol. Never output plain text only.'
+    : '')
+
+  const messages: Message[] = [
+    { role: 'system', content: systemPrompt },
+    ...history,
+    { role: 'user', content: userInput },
+  ]
+
+  // ── 3. Stream and parse ──────────────────────────────────────────────────
+  let blockCounter = 0
+  const parser = new VisualStreamParser()
+  let fullResponse = ''
+  let hasAnyBlock = false
+
+  parser.on((event) => {
+    switch (event.type) {
+      case 'think_chunk':
+        emit('think.chunk', { text: event.payload.text })
+        break
+      case 'think_end':
+        emit('think.finished', {})
+        break
+
+      case 'text_start':
+        blockCounter++
+        emit('block.text_start', { blockId: `b${blockCounter}` })
+        hasAnyBlock = true
+        break
+      case 'text_chunk':
+        emit('block.text_chunk', { text: event.payload.text })
+        hasAnyBlock = true
+        break
+      case 'text_end':
+        emit('block.text_end', {})
+        break
+
+      case 'visual_start':
+        blockCounter++
+        emit('block.visual_start', { blockId: `b${blockCounter}`, visualType: event.payload.visualType })
+        hasAnyBlock = true
+        break
+      case 'visual_end':
+        if (event.payload.isComplete) {
+          emit('block.visual', {
+            blockId: `b${blockCounter}`,
+            visualType: event.payload.visualType,
+            content: event.payload.content,
+          })
+        }
+        break
+    }
+  })
+
+  try {
+    await streamCall({
+      messages,
+      maxTokens: projectConfig.llm.maxTokens,
+      temperature: projectConfig.llm.temperature,
+      signal,
+      onChunk: (text) => {
+        fullResponse += text
+        parser.push(text)
+      },
+    })
+  } catch (err: unknown) {
+    const name = (err as Error)?.name
+    if (name === 'AbortError' || signal?.aborted) {
+      emit('error.surfaced', { message: '生成被中断' })
+    } else {
+      emit('error.surfaced', { message: `生成失败: ${(err as Error)?.message || '未知错误'}` })
+    }
+    stateStore.updateArtifactStatus(artifactId, 'ready')
+    stateStore.updateTurnStatus(turnId, 'errored', artifactId)
+    return
+  }
+
+  parser.end()
+
+  // ── 4. Safety net: if no blocks produced, degrade to conversational ──────
+  if (!hasAnyBlock && fullResponse.trim()) {
+    const clean = fullResponse
+      .replace(/<think[\s\S]*?<\/think>/gi, '')
+      .replace(/<[^>]+>/g, '')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim()
+    emit('conversational.reply', { text: clean || '…', done: false })
+    emit('conversational.reply', { text: '', done: true })
+  } else {
+    emit('stream.completed', { artifactId })
+  }
+
+  stateStore.updateArtifactStatus(artifactId, 'ready')
+  stateStore.updateTurnStatus(turnId, 'completed', artifactId)
+}
 
 // ─── Budget defaults ──────────────────────────────────────────────────────
 

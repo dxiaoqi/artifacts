@@ -5,6 +5,7 @@ import { ArrowUp, Loader2, Download, Image as ImageIcon, Sun, Moon } from 'lucid
 import { MessageItem, type ChatMessage, type InProgressArtifact } from '@/components/MessageItem'
 import { type WidgetState } from '@/components/WidgetRenderer'
 import { type PlanPhase } from '@/components/PlanProgress'
+import { type ContentBlock } from '@/lib/types'
 import {
   exportConversationJson,
   exportConversationAsImage,
@@ -15,6 +16,72 @@ interface StreamMeta { conversationId?: string; artifactId?: string; turnId?: st
 
 let msgCounter = 0
 function nextId() { return `msg_${++msgCounter}` }
+
+let splitBlockCounter = 0
+/**
+ * Post-processing fallback: scan each text block for embedded <visual type="...">...</visual>
+ * sequences and split them into proper text + visual blocks.
+ * This catches the edge case where a partial-tag chunk boundary caused the parser to flush
+ * the <visual> opening tag as preamble text, resulting in the full visual ending up in a
+ * text block.
+ */
+function extractEmbeddedVisuals(blocks: ContentBlock[]): ContentBlock[] {
+  const result: ContentBlock[] = []
+  for (const block of blocks) {
+    if (block.kind !== 'text') { result.push(block); continue }
+
+    const content = block.content
+    // Fast path: no <visual in this block
+    if (!content.includes('<visual')) { result.push(block); continue }
+
+    let remaining = content
+    let changed = false
+
+    while (remaining.length > 0) {
+      const vStart = remaining.indexOf('<visual')
+      if (vStart === -1) break
+
+      const gtIdx = remaining.indexOf('>', vStart)
+      if (gtIdx === -1) break
+
+      const tagContent = remaining.slice(vStart, gtIdx + 1)
+      const typeMatch = tagContent.match(/type\s*=\s*['"]([^'"]+)['"]/)
+      if (!typeMatch) { break }
+
+      const visualType = typeMatch[1]
+      const closeTag = '</visual>'
+      const vEnd = remaining.indexOf(closeTag, gtIdx)
+      if (vEnd === -1) break
+
+      // Text before the visual
+      const beforeText = remaining.slice(0, vStart)
+      if (beforeText) {
+        result.push({ kind: 'text', id: `split_${++splitBlockCounter}`, content: beforeText, isStreaming: false })
+      }
+
+      // The visual block itself
+      const visualContent = remaining.slice(gtIdx + 1, vEnd).trim()
+      const safeType = (['svg', 'html', 'threejs'].includes(visualType) ? visualType : 'html') as import('@/lib/types').VisualBlockType
+      result.push({
+        kind: 'visual',
+        id: `split_${++splitBlockCounter}`,
+        visualType: safeType,
+        content: visualContent,
+        isComplete: true,
+      })
+
+      remaining = remaining.slice(vEnd + closeTag.length)
+      changed = true
+    }
+
+    if (!changed) {
+      result.push(block)
+    } else if (remaining) {
+      result.push({ kind: 'text', id: `split_${++splitBlockCounter}`, content: remaining, isStreaming: false })
+    }
+  }
+  return result
+}
 
 // ─── Export action state ──────────────────────────────────────────────────────
 
@@ -35,6 +102,11 @@ export default function HomePage() {
   const [inProgressThinkText, setInProgressThinkText] = useState('')
   const [inProgressStatusMessage, setInProgressStatusMessage] = useState('')
 
+  // ── Visual V2 block state ─────────────────────────────────────────────────
+  // Blocks are built in-progress during streaming, then committed to the message
+  const [inProgressBlocks, setInProgressBlocks] = useState<ContentBlock[]>([])
+  const blockCounterRef = useRef(0)
+
   // Export states
   const [jsonExportState, setJsonExportState] = useState<ExportBtnState>('idle')
   const [imgExportState, setImgExportState] = useState<ExportBtnState>('idle')
@@ -51,6 +123,33 @@ export default function HomePage() {
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages.length, inProgressWidgets.length])
+
+  // Auto-focus the input box after the AI finishes responding
+  useEffect(() => {
+    if (!isLoading) {
+      textareaRef.current?.focus()
+    }
+  }, [isLoading])
+
+  // ─── sendPrompt from visual iframes ────────────────────────────────────────
+  // MessageItem re-dispatches SEND_PROMPT from VisualRenderer as a window message
+  // so page.tsx can intercept it at the top level.
+  const pendingSendPromptRef = useRef<string | null>(null)
+
+  useEffect(() => {
+    const handler = (e: MessageEvent) => {
+      if (e.data?.type !== 'send-prompt') return
+      const text = String(e.data.text ?? '').trim()
+      if (!text) return
+      pendingSendPromptRef.current = text
+      setInput(text)
+    }
+    window.addEventListener('message', handler)
+    return () => window.removeEventListener('message', handler)
+  }, [])
+
+  // Ref that always points to the latest handleSubmit — set below after declaration.
+  const handleSubmitRef = useRef<() => void>(() => {})
 
   // ─── Theme toggle ──────────────────────────────────────────────────────────
 
@@ -75,7 +174,7 @@ export default function HomePage() {
     if (!messagesRootRef.current || !messages.length) return
     setImgExportState('loading')
     try {
-      await exportConversationAsImage(messagesRootRef.current)
+      await exportConversationAsImage(messagesRootRef.current, messages as ExportableChatMessage[])
       setImgExportState('done')
     } catch { /* ignore */ }
     setTimeout(() => setImgExportState('idle'), 2000)
@@ -103,7 +202,9 @@ export default function HomePage() {
     setInProgressTransitionMessage('')
     setInProgressThinkText('')
     setInProgressStatusMessage('')
+    setInProgressBlocks([])
     widgetCountRef.current = 0
+    blockCounterRef.current = 0
   }, [])
 
   // ─── Message helpers ───────────────────────────────────────────────────────
@@ -212,6 +313,86 @@ export default function HomePage() {
       case 'think.chunk':
         setInProgressThinkText(prev => prev + (payload.text as string))
         break
+
+      // ── Visual V2 block events ────────────────────────────────────────────
+
+      case 'block.text_start': {
+        const id = `b${++blockCounterRef.current}`
+        setInProgressBlocks(prev => [...prev, { kind: 'text', id, content: '', isStreaming: true }])
+        break
+      }
+      case 'block.text_chunk': {
+        const text = payload.text as string
+        setInProgressBlocks(prev => {
+          if (!prev.length) return prev
+          const last = prev[prev.length - 1]
+          if (last.kind !== 'text') return prev
+          return [...prev.slice(0, -1), { ...last, content: last.content + text }]
+        })
+        break
+      }
+      case 'block.text_end': {
+        setInProgressBlocks(prev => {
+          if (!prev.length) return prev
+          const last = prev[prev.length - 1]
+          if (last.kind !== 'text') return prev
+          return [...prev.slice(0, -1), { ...last, isStreaming: false }]
+        })
+        break
+      }
+      case 'block.visual_start': {
+        const id = `b${++blockCounterRef.current}`
+        const visualType = (payload.visualType as string) || 'html'
+        setInProgressBlocks(prev => [...prev, {
+          kind: 'visual', id,
+          visualType: visualType as ContentBlock extends { kind: 'visual' } ? ContentBlock['visualType'] : never,
+          content: '',
+          isComplete: false,
+        }])
+        break
+      }
+      case 'block.visual': {
+        const { content, visualType: vt } = payload as { content: string; visualType: string }
+        setInProgressBlocks(prev => {
+          // Find last incomplete visual block and mark it complete
+          for (let i = prev.length - 1; i >= 0; i--) {
+            const b = prev[i]
+            if (b.kind === 'visual' && !b.isComplete) {
+              const updated = [...prev]
+              updated[i] = { ...b, content, isComplete: true, visualType: (vt || b.visualType) as ContentBlock extends { kind: 'visual' } ? ContentBlock['visualType'] : never }
+              return updated
+            }
+          }
+          return prev
+        })
+        break
+      }
+      case 'stream.completed': {
+        // Commit blocks to the message
+        const msgId = currentAssistantMsgIdRef.current
+        setInProgressBlocks(currentBlocks => {
+          if (msgId && currentBlocks.length > 0) {
+            // Post-process: extract any visuals that ended up embedded in text blocks
+            // due to partial-tag chunk boundary issues in the stream parser.
+            const committed = extractEmbeddedVisuals(
+              currentBlocks.map(b => b.kind === 'text' ? { ...b, isStreaming: false } : b)
+            )
+            setMessages(prev => prev.map(m =>
+              m.id === msgId ? {
+                ...m,
+                content: '',
+                isStreaming: false,
+                blocks: committed,
+                artifactComplete: true,
+              } : m
+            ))
+          }
+          return []
+        })
+        setIsLoading(false)
+        setInProgressStatusMessage('')
+        break
+      }
 
       case 'plan.completed': {
         // Commit in-progress artifact state into the current assistant message
@@ -334,6 +515,18 @@ export default function HomePage() {
     }
   }, [input, isLoading, addMessage, updateMessage, processEvent, resetInProgress])
 
+  // Keep handleSubmitRef current so the sendPrompt handler (declared earlier)
+  // can trigger the latest version without a stale closure.
+  handleSubmitRef.current = handleSubmit
+
+  // After setInput settles (input === pendingText), fire the submit.
+  useEffect(() => {
+    if (pendingSendPromptRef.current && input === pendingSendPromptRef.current) {
+      pendingSendPromptRef.current = null
+      handleSubmitRef.current()
+    }
+  }, [input])
+
   const handleKey = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (!isLoading && input.trim()) handleSubmit() }
   }
@@ -356,6 +549,7 @@ export default function HomePage() {
     transitionMessage: inProgressTransitionMessage,
     thinkText: inProgressThinkText,
     statusMessage: inProgressStatusMessage,
+    blocks: inProgressBlocks,
   } : undefined
 
   // ─── Render ────────────────────────────────────────────────────────────────
@@ -384,14 +578,16 @@ export default function HomePage() {
 
         {/* Header actions */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-          {/* JSON export */}
-          <HeaderBtn
-            label={jsonExportState === 'done' ? '已导出' : 'JSON'}
-            icon={<Download width={11} height={11} />}
-            disabled={!messages.length}
-            done={jsonExportState === 'done'}
-            onClick={handleJsonExport}
-          />
+          {/* JSON export — only shown when ARTIFACTS_DEBUG=true */}
+          {process.env.NEXT_PUBLIC_DEBUG === 'true' && (
+            <HeaderBtn
+              label={jsonExportState === 'done' ? '已导出' : 'JSON'}
+              icon={<Download width={11} height={11} />}
+              disabled={!messages.length}
+              done={jsonExportState === 'done'}
+              onClick={handleJsonExport}
+            />
+          )}
           {/* Image export */}
           <HeaderBtn
             label={imgExportState === 'loading' ? '截图中…' : imgExportState === 'done' ? '已保存' : '导出图片'}
