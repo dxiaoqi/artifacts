@@ -19,66 +19,80 @@ function nextId() { return `msg_${++msgCounter}` }
 
 let splitBlockCounter = 0
 /**
- * Post-processing fallback: scan each text block for embedded <visual type="...">...</visual>
- * sequences and split them into proper text + visual blocks.
- * This catches the edge case where a partial-tag chunk boundary caused the parser to flush
- * the <visual> opening tag as preamble text, resulting in the full visual ending up in a
- * text block.
+ * Post-processing: scan each text block for:
+ *  1. Embedded <visual type="...">...</visual> sequences (parser boundary edge case)
+ *  2. Markdown fenced code blocks (```html / ```svg / ```threejs) — model compliance fallback
+ * Both are promoted to proper visual blocks so the user sees a rendered component.
  */
 function extractEmbeddedVisuals(blocks: ContentBlock[]): ContentBlock[] {
+  const FENCE_RE = /```(html?|svg|threejs|javascript|js)\s*\n([\s\S]*?)(?:```|$)/gi
+
   const result: ContentBlock[] = []
   for (const block of blocks) {
     if (block.kind !== 'text') { result.push(block); continue }
 
     const content = block.content
-    // Fast path: no <visual in this block
-    if (!content.includes('<visual')) { result.push(block); continue }
+    const hasVisual = content.includes('<visual')
+    const hasFence = content.includes('```')
 
+    // Fast path: nothing to extract
+    if (!hasVisual && !hasFence) { result.push(block); continue }
+
+    // ── 1. Extract <visual type="...">…</visual> tags ──────────────────────
     let remaining = content
     let changed = false
 
-    while (remaining.length > 0) {
-      const vStart = remaining.indexOf('<visual')
-      if (vStart === -1) break
-
-      const gtIdx = remaining.indexOf('>', vStart)
-      if (gtIdx === -1) break
-
-      const tagContent = remaining.slice(vStart, gtIdx + 1)
-      const typeMatch = tagContent.match(/type\s*=\s*['"]([^'"]+)['"]/)
-      if (!typeMatch) { break }
-
-      const visualType = typeMatch[1]
-      const closeTag = '</visual>'
-      const vEnd = remaining.indexOf(closeTag, gtIdx)
-      if (vEnd === -1) break
-
-      // Text before the visual
-      const beforeText = remaining.slice(0, vStart)
-      if (beforeText) {
-        result.push({ kind: 'text', id: `split_${++splitBlockCounter}`, content: beforeText, isStreaming: false })
+    if (hasVisual) {
+      while (remaining.length > 0) {
+        const vStart = remaining.indexOf('<visual')
+        if (vStart === -1) break
+        const gtIdx = remaining.indexOf('>', vStart)
+        if (gtIdx === -1) break
+        const tagContent = remaining.slice(vStart, gtIdx + 1)
+        const typeMatch = tagContent.match(/type\s*=\s*['"]([^'"]+)['"]/)
+        if (!typeMatch) break
+        const visualType = typeMatch[1]
+        const closeTag = '</visual>'
+        const vEnd = remaining.indexOf(closeTag, gtIdx)
+        if (vEnd === -1) break
+        const beforeText = remaining.slice(0, vStart)
+        if (beforeText) result.push({ kind: 'text', id: `split_${++splitBlockCounter}`, content: beforeText, isStreaming: false })
+        const visualContent = remaining.slice(gtIdx + 1, vEnd).trim()
+        const safeType = (['svg', 'html', 'threejs'].includes(visualType) ? visualType : 'html') as import('@/lib/types').VisualBlockType
+        result.push({ kind: 'visual', id: `split_${++splitBlockCounter}`, visualType: safeType, content: visualContent, isComplete: true })
+        remaining = remaining.slice(vEnd + closeTag.length)
+        changed = true
       }
-
-      // The visual block itself
-      const visualContent = remaining.slice(gtIdx + 1, vEnd).trim()
-      const safeType = (['svg', 'html', 'threejs'].includes(visualType) ? visualType : 'html') as import('@/lib/types').VisualBlockType
-      result.push({
-        kind: 'visual',
-        id: `split_${++splitBlockCounter}`,
-        visualType: safeType,
-        content: visualContent,
-        isComplete: true,
-      })
-
-      remaining = remaining.slice(vEnd + closeTag.length)
-      changed = true
+      if (remaining && changed) {
+        result.push({ kind: 'text', id: `split_${++splitBlockCounter}`, content: remaining, isStreaming: false })
+        continue
+      }
     }
 
-    if (!changed) {
-      result.push(block)
-    } else if (remaining) {
-      result.push({ kind: 'text', id: `split_${++splitBlockCounter}`, content: remaining, isStreaming: false })
+    // ── 2. Extract ```html/svg/threejs fences (model compliance fallback) ──
+    if (!changed && hasFence) {
+      FENCE_RE.lastIndex = 0
+      let fenceChanged = false
+      let fenceRemaining = remaining
+      let m: RegExpExecArray | null
+      while ((m = FENCE_RE.exec(fenceRemaining)) !== null) {
+        const lang = m[1].toLowerCase()
+        const code = m[2].trim()
+        const vt = (lang === 'svg' ? 'svg' : lang === 'threejs' ? 'threejs' : 'html') as import('@/lib/types').VisualBlockType
+        const before = fenceRemaining.slice(0, m.index).trim()
+        if (before) result.push({ kind: 'text', id: `split_${++splitBlockCounter}`, content: before, isStreaming: false })
+        result.push({ kind: 'visual', id: `split_${++splitBlockCounter}`, visualType: vt, content: code, isComplete: true })
+        fenceRemaining = fenceRemaining.slice(m.index + m[0].length)
+        FENCE_RE.lastIndex = 0  // reset for next search on sliced string
+        fenceChanged = true
+      }
+      if (fenceChanged) {
+        if (fenceRemaining.trim()) result.push({ kind: 'text', id: `split_${++splitBlockCounter}`, content: fenceRemaining.trim(), isStreaming: false })
+        continue
+      }
     }
+
+    result.push(block)
   }
   return result
 }
@@ -131,25 +145,23 @@ export default function HomePage() {
     }
   }, [isLoading])
 
-  // ─── sendPrompt from visual iframes ────────────────────────────────────────
-  // MessageItem re-dispatches SEND_PROMPT from VisualRenderer as a window message
-  // so page.tsx can intercept it at the top level.
-  const pendingSendPromptRef = useRef<string | null>(null)
+  // Ref always pointing to the latest handleSubmit — updated on every render below.
+  const handleSubmitRef = useRef<(text?: string) => void>(() => {})
 
+  // ─── sendPrompt from visual iframes ────────────────────────────────────────
+  // VisualRenderer calls onSendPrompt → MessageItem dispatches a window message
+  // → here we catch it and submit directly (no async state-round-trip needed).
   useEffect(() => {
     const handler = (e: MessageEvent) => {
       if (e.data?.type !== 'send-prompt') return
       const text = String(e.data.text ?? '').trim()
       if (!text) return
-      pendingSendPromptRef.current = text
-      setInput(text)
+      setInput(text)               // populate the input box visually
+      handleSubmitRef.current(text) // submit immediately with the override text
     }
     window.addEventListener('message', handler)
     return () => window.removeEventListener('message', handler)
   }, [])
-
-  // Ref that always points to the latest handleSubmit — set below after declaration.
-  const handleSubmitRef = useRef<() => void>(() => {})
 
   // ─── Theme toggle ──────────────────────────────────────────────────────────
 
@@ -446,9 +458,9 @@ export default function HomePage() {
 
   // ─── Submit ────────────────────────────────────────────────────────────────
 
-  const handleSubmit = useCallback(async () => {
-    if (!input.trim() || isLoading) return
-    const userText = input.trim()
+  const handleSubmit = useCallback(async (overrideText?: string) => {
+    const userText = (overrideText ?? input).trim()
+    if (!userText || isLoading) return
     setInput('')
     if (textareaRef.current) {
       textareaRef.current.style.height = 'auto'
@@ -515,17 +527,9 @@ export default function HomePage() {
     }
   }, [input, isLoading, addMessage, updateMessage, processEvent, resetInProgress])
 
-  // Keep handleSubmitRef current so the sendPrompt handler (declared earlier)
-  // can trigger the latest version without a stale closure.
+  // Keep ref current so the sendPrompt handler (declared before handleSubmit)
+  // always calls the latest closure (with up-to-date isLoading etc.).
   handleSubmitRef.current = handleSubmit
-
-  // After setInput settles (input === pendingText), fire the submit.
-  useEffect(() => {
-    if (pendingSendPromptRef.current && input === pendingSendPromptRef.current) {
-      pendingSendPromptRef.current = null
-      handleSubmitRef.current()
-    }
-  }, [input])
 
   const handleKey = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (!isLoading && input.trim()) handleSubmit() }
@@ -679,7 +683,7 @@ export default function HomePage() {
               }}
             />
             <button
-              onClick={handleSubmit}
+              onClick={() => handleSubmit()}
               disabled={isLoading || !input.trim()}
               onMouseDown={e => { if (!isLoading && input.trim()) (e.currentTarget.style.transform = 'scale(0.95)') }}
               onMouseUp={e => (e.currentTarget.style.transform = 'scale(1)')}

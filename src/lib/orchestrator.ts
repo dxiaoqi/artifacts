@@ -22,7 +22,9 @@ import { artifactsDefaultEnabled, projectConfig } from './config'
 
 function isTrivialInput(input: string): boolean {
   const t = input.trim()
-  if (t.replace(/[\s\W]/g, '').length < 4) return true
+  // \W is ASCII-only in JS — Chinese chars match \W and get stripped, making all
+  // Chinese input appear "trivial". Use \s-only replacement to count meaningful chars.
+  if (t.replace(/\s/g, '').length < 4) return true
   if (/^[?？!！.。…,，、~～\s]+$/.test(t)) return true
   if (/^(hi|hello|hey|你好|在吗|早上好|嗨)[\s!！。~]*$/i.test(t)) return true
   if (/^(嗯+|好的|收到|谢谢|ok|哦)[\s!！。]*$/i.test(t)) return true
@@ -126,9 +128,14 @@ export async function runVisualOrchestrator(opts: VisualOrchestratorOptions) {
   // ── 2. Build system prompt ───────────────────────────────────────────────
   emit('status', { message: '正在生成…' })
 
-  const systemPrompt = buildVisualSystemPrompt() + (artifactsDefaultEnabled
-    ? '\n\n[CONFIG] Always generate visual content using <text>/<visual> protocol. Never output plain text only.'
-    : '')
+  const artifactHint = artifactsDefaultEnabled
+    ? '\n\n[STRICT OUTPUT RULE]\n' +
+      '- ALL interactive components, calculators, charts, diagrams MUST use <visual type="html"> or <visual type="svg">.\n' +
+      '- NEVER wrap HTML/SVG code in markdown fences (```html). Use <visual type="html"> ONLY.\n' +
+      '- NEVER output "Here is the code:" followed by a code block. Render it directly.\n' +
+      '- If the user asks to build/create/show something interactive, output <visual type="html"> immediately.'
+    : ''
+  const systemPrompt = buildVisualSystemPrompt() + artifactHint
 
   const messages: Message[] = [
     { role: 'system', content: systemPrompt },
@@ -141,6 +148,16 @@ export async function runVisualOrchestrator(opts: VisualOrchestratorOptions) {
   const parser = new VisualStreamParser()
   let fullResponse = ''
   let hasAnyBlock = false
+
+  // Track incomplete visual blocks for continuation
+  interface IncompleteVisual {
+    blockId: string
+    visualType: string
+    partialContent: string
+  }
+  let incompleteVisual: IncompleteVisual | null = null
+  let lastVisualBlockId = ''
+  let lastVisualType = ''
 
   parser.on((event) => {
     switch (event.type) {
@@ -166,23 +183,35 @@ export async function runVisualOrchestrator(opts: VisualOrchestratorOptions) {
 
       case 'visual_start':
         blockCounter++
-        emit('block.visual_start', { blockId: `b${blockCounter}`, visualType: event.payload.visualType })
+        lastVisualBlockId = `b${blockCounter}`
+        lastVisualType = String(event.payload.visualType ?? 'html')
+        emit('block.visual_start', { blockId: lastVisualBlockId, visualType: lastVisualType })
         hasAnyBlock = true
+        incompleteVisual = null  // reset
         break
       case 'visual_end':
         if (event.payload.isComplete) {
           emit('block.visual', {
-            blockId: `b${blockCounter}`,
+            blockId: lastVisualBlockId,
             visualType: event.payload.visualType,
             content: event.payload.content,
           })
+          incompleteVisual = null
+        } else {
+          // Stream ended before </visual> — save partial for continuation
+          incompleteVisual = {
+            blockId: lastVisualBlockId,
+            visualType: lastVisualType,
+            partialContent: String(event.payload.content ?? ''),
+          }
         }
         break
     }
   })
 
+  let finishReason: 'stop' | 'length' | null = null
   try {
-    await streamCall({
+    const result = await streamCall({
       messages,
       maxTokens: projectConfig.llm.maxTokens,
       temperature: projectConfig.llm.temperature,
@@ -192,6 +221,7 @@ export async function runVisualOrchestrator(opts: VisualOrchestratorOptions) {
         parser.push(text)
       },
     })
+    finishReason = result.finishReason
   } catch (err: unknown) {
     const name = (err as Error)?.name
     if (name === 'AbortError' || signal?.aborted) {
@@ -206,15 +236,138 @@ export async function runVisualOrchestrator(opts: VisualOrchestratorOptions) {
 
   parser.end()
 
-  // ── 4. Safety net: if no blocks produced, degrade to conversational ──────
+
+  // ── 3b. Continuation: if truncated, keep completing the visual ───────────
+  const MAX_CONTINUATIONS = 3
+  let continuationCount = 0
+
+  while (
+    finishReason === 'length' &&
+    incompleteVisual !== null &&
+    !signal?.aborted &&
+    continuationCount < MAX_CONTINUATIONS
+  ) {
+    continuationCount++
+    // snapshot so TypeScript knows it's non-null inside this iteration
+    const snap = incompleteVisual as IncompleteVisual
+    emit('status', { message: `补全中… (${continuationCount}/${MAX_CONTINUATIONS})` })
+
+    const contMessages: Message[] = [
+      ...messages,
+      { role: 'assistant', content: fullResponse },
+      {
+        role: 'user',
+        content: '[CONTINUE] Continue generating exactly from where you stopped. ' +
+          'Do NOT repeat content. Do NOT add any preamble. ' +
+          'Just continue the code from the exact cutoff point.',
+      },
+    ]
+
+    incompleteVisual = null   // reset before next parse
+    finishReason = null
+
+    const contParser = new VisualStreamParser()
+    let contVisualContent = ''
+
+    contParser.on((event) => {
+      switch (event.type) {
+        case 'text_chunk':
+          contVisualContent += String(event.payload.text ?? '')
+          break
+        case 'visual_end':
+          if (event.payload.isComplete) {
+            contVisualContent += String(event.payload.content ?? '')
+          } else {
+            incompleteVisual = {
+              blockId: snap.blockId,
+              visualType: snap.visualType,
+              partialContent: snap.partialContent + contVisualContent + String(event.payload.content ?? ''),
+            }
+          }
+          break
+        case 'visual_start':
+          break
+      }
+    })
+
+    try {
+      const contResult = await streamCall({
+        messages: contMessages,
+        maxTokens: projectConfig.llm.maxTokens,
+        temperature: 0,
+        signal,
+        onChunk: (text) => {
+          fullResponse += text
+          contParser.push(text)
+        },
+      })
+      finishReason = contResult.finishReason
+    } catch {
+      break
+    }
+
+    contParser.end()
+
+    const mergedContent = snap.partialContent + contVisualContent
+
+    if (incompleteVisual === null) {
+      emit('block.visual', {
+        blockId: snap.blockId,
+        visualType: snap.visualType,
+        content: mergedContent,
+      })
+    } else {
+      ;(incompleteVisual as IncompleteVisual).partialContent = mergedContent
+    }
+  }
+
+  // Hit max continuations — emit whatever we have so the user sees something
+  if (incompleteVisual !== null) {
+    const iv = incompleteVisual as IncompleteVisual
+    emit('block.visual', {
+      blockId: iv.blockId,
+      visualType: iv.visualType,
+      content: iv.partialContent,
+    })
+  }
+
+  // ── 4. Safety net ────────────────────────────────────────────────────────
   if (!hasAnyBlock && fullResponse.trim()) {
-    const clean = fullResponse
-      .replace(/<think[\s\S]*?<\/think>/gi, '')
-      .replace(/<[^>]+>/g, '')
-      .replace(/\n{3,}/g, '\n\n')
-      .trim()
-    emit('conversational.reply', { text: clean || '…', done: false })
-    emit('conversational.reply', { text: '', done: true })
+    // Before degrading: check if the model output markdown fenced code blocks
+    // (```html / ```svg / ```javascript) instead of <visual> tags.
+    // Extract the first fenced block and emit it as a visual so the user
+    // still sees a rendered result rather than raw code text.
+    const fenceMatch = fullResponse.match(/```(html?|svg|javascript|js|threejs)\s*\n([\s\S]*?)(?:```|$)/i)
+    if (fenceMatch) {
+      const lang = fenceMatch[1].toLowerCase()
+      const code = fenceMatch[2].trim()
+      const visualType = (lang === 'svg') ? 'svg'
+        : (lang === 'threejs') ? 'threejs'
+        : 'html'
+
+      // Emit any preamble text before the fence
+      const preamble = fullResponse.slice(0, fullResponse.indexOf('```')).trim()
+      if (preamble) {
+        emit('block.text_start', { blockId: 'b0' })
+        emit('block.text_chunk', { text: preamble })
+        emit('block.text_end', {})
+      }
+
+      // Emit the code block as a visual
+      blockCounter++
+      emit('block.visual_start', { blockId: `b${blockCounter}`, visualType })
+      emit('block.visual', { blockId: `b${blockCounter}`, visualType, content: code })
+      emit('stream.completed', { artifactId })
+    } else {
+      // No recoverable code block found — degrade to conversational text
+      const clean = fullResponse
+        .replace(/<think[\s\S]*?<\/think>/gi, '')
+        .replace(/<[^>]+>/g, '')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim()
+      emit('conversational.reply', { text: clean || '…', done: false })
+      emit('conversational.reply', { text: '', done: true })
+    }
   } else {
     emit('stream.completed', { artifactId })
   }

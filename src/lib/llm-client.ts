@@ -33,10 +33,16 @@ export interface StreamCallOptions {
   onChunk?: (text: string) => void
 }
 
+export interface StreamCallResult {
+  text: string
+  /** 'stop' = normal end, 'length' = hit max_tokens, null = unknown */
+  finishReason: 'stop' | 'length' | null
+}
+
 /**
- * 流式调用 LLM，返回完整响应文本
+ * 流式调用 LLM，返回完整响应文本及终止原因
  */
-export async function streamCall(opts: StreamCallOptions): Promise<string> {
+export async function streamCall(opts: StreamCallOptions): Promise<StreamCallResult> {
   const { messages, maxTokens = 8000, temperature = 0.7, signal, onChunk } = opts
 
   const stream = await getClient().chat.completions.create({
@@ -45,9 +51,11 @@ export async function streamCall(opts: StreamCallOptions): Promise<string> {
     max_tokens: maxTokens,
     temperature,
     stream: true,
+    stream_options: { include_usage: false },
   })
 
   let full = ''
+  let finishReason: 'stop' | 'length' | null = null
   for await (const chunk of stream) {
     if (signal?.aborted) break
     const text = chunk.choices[0]?.delta?.content ?? ''
@@ -55,8 +63,10 @@ export async function streamCall(opts: StreamCallOptions): Promise<string> {
       full += text
       onChunk?.(text)
     }
+    const fr = chunk.choices[0]?.finish_reason
+    if (fr) finishReason = fr as 'stop' | 'length'
   }
-  return full
+  return { text: full, finishReason }
 }
 
 /**
