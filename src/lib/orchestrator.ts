@@ -22,7 +22,9 @@ import { artifactsDefaultEnabled, projectConfig } from './config'
 
 function isTrivialInput(input: string): boolean {
   const t = input.trim()
-  if (t.replace(/[\s\W]/g, '').length < 4) return true
+  // \W is ASCII-only in JS — Chinese chars match \W and get stripped, making all
+  // Chinese input appear "trivial". Use \s-only replacement to count meaningful chars.
+  if (t.replace(/\s/g, '').length < 4) return true
   if (/^[?？!！.。…,，、~～\s]+$/.test(t)) return true
   if (/^(hi|hello|hey|你好|在吗|早上好|嗨)[\s!！。~]*$/i.test(t)) return true
   if (/^(嗯+|好的|收到|谢谢|ok|哦)[\s!！。]*$/i.test(t)) return true
@@ -233,6 +235,7 @@ export async function runVisualOrchestrator(opts: VisualOrchestratorOptions) {
   }
 
   parser.end()
+
 
   // ── 3b. Continuation: if truncated, keep completing the visual ───────────
   const MAX_CONTINUATIONS = 3
