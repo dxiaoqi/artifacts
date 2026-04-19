@@ -74,7 +74,7 @@ export function loadExtraSkills(opts: {
 }
 
 /**
- * 构建 Executor 调用的 system prompt
+ * 构建 Executor 调用的 system prompt (legacy plan/phase/widget)
  */
 export function buildSystemPrompt(opts: {
   recipeId?: string | null
@@ -84,4 +84,23 @@ export function buildSystemPrompt(opts: {
   const core = loadCoreSkills()
   const extra = loadExtraSkills(opts)
   return core + (extra ? '\n' + extra : '')
+}
+
+/**
+ * 构建 Visual 系统的 system prompt (V2 text/visual protocol)
+ */
+export function buildVisualSystemPrompt(): string {
+  const parts: string[] = []
+  // 1. Entry point: routing + format declaration
+  parts.push(readSkillFile('SKILL.md'))
+  parts.push('\n---\n')
+  // 2. Visual protocol (output format spec) — immediately after SKILL so model sees it before content rules
+  parts.push(readSkillFile('visual-protocol.md'))
+  parts.push('\n---\n')
+  // 3. Content principles + demos
+  parts.push(readSkillFile('rules.md'))
+  parts.push('\n---\n')
+  // 4. Design theme (color system, CSS vars)
+  parts.push(readSkillFile('design/theme.md'))
+  return parts.join('\n')
 }

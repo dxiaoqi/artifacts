@@ -4,7 +4,10 @@ import { useRef, useState } from 'react'
 import { Copy, Check, Image as ImageIcon, Loader2 } from 'lucide-react'
 import { PlanProgress, type PlanPhase } from './PlanProgress'
 import { WidgetRenderer, type WidgetState } from './WidgetRenderer'
+import { VisualRenderer } from './VisualRenderer'
+import { ProseMarkdown } from './ProseMarkdown'
 import { exportMessageAsImage } from '@/lib/export-image'
+import type { ContentBlock } from '@/lib/types'
 
 export interface ChatMessage {
   id: string
@@ -12,11 +15,13 @@ export interface ChatMessage {
   content: string
   isStreaming?: boolean
   timestamp: number
-  // Artifact data — committed after plan.completed
+  // Legacy artifact data (plan/phase/widget protocol)
   widgets?: WidgetState[]
   planPhases?: PlanPhase[]
   thinkText?: string
   artifactComplete?: boolean
+  // Visual V2 block data
+  blocks?: ContentBlock[]
 }
 
 // In-progress artifact data (only passed for the currently-generating message)
@@ -28,6 +33,8 @@ export interface InProgressArtifact {
   transitionMessage: string
   thinkText: string
   statusMessage: string
+  // Visual V2
+  blocks?: ContentBlock[]
 }
 
 interface Props {
@@ -69,7 +76,7 @@ export function MessageItem({ message, inProgress }: Props) {
     if (!msgRef.current) return
     setImgState('loading')
     try {
-      await exportMessageAsImage(msgRef.current, msgRef.current, message.content.slice(0, 40))
+      await exportMessageAsImage(msgRef.current, msgRef.current, message.content.slice(0, 40), message.blocks)
       setImgState('done')
       setTimeout(() => setImgState('idle'), 2000)
     } catch {
@@ -161,12 +168,9 @@ export function MessageItem({ message, inProgress }: Props) {
 
       {/* Content area */}
       <div ref={msgRef} style={{ paddingLeft: 32 }}>
-        {/* Pure text reply (conversational) */}
+        {/* Pure text reply (conversational) — render as Markdown */}
         {message.content && !hasArtifact && (
-          <div style={{ fontSize: '14px', lineHeight: 1.75, color: 'var(--text-primary)' }}>
-            {message.content}
-            {message.isStreaming && <span className="streaming-cursor" />}
-          </div>
+          <ProseMarkdown content={message.content} isStreaming={message.isStreaming} />
         )}
 
         {/* Loading state (no content yet, no artifact) */}
@@ -206,8 +210,42 @@ export function MessageItem({ message, inProgress }: Props) {
           />
         )}
 
-        {/* Widgets */}
-        {widgets.length > 0 && (
+        {/* ── Visual V2 blocks (text/visual protocol) ── */}
+        {(() => {
+          const blocks = isGenerating
+            ? (inProgress?.blocks ?? [])
+            : (message.blocks ?? [])
+          if (blocks.length > 0) {
+            return (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+                {blocks.map(block =>
+                  block.kind === 'text' ? (
+                    <ProseMarkdown
+                      key={block.id}
+                      content={block.content}
+                      isStreaming={block.isStreaming}
+                    />
+                  ) : (
+                    <VisualRenderer
+                      key={block.id}
+                      content={block.content}
+                      declaredType={block.visualType}
+                      isComplete={block.isComplete}
+                      onSendPrompt={(text) => {
+                        // sendPrompt from visual — handled by page.tsx message listener
+                        window.postMessage({ type: 'send-prompt', text }, '*')
+                      }}
+                    />
+                  )
+                )}
+              </div>
+            )
+          }
+          return null
+        })()}
+
+        {/* ── Legacy widgets (plan/phase/widget protocol) ── */}
+        {widgets.length > 0 && !(isGenerating ? inProgress?.blocks?.length : message.blocks?.length) && (
           <div>
             {widgets.map(w => (
               <WidgetRenderer key={w.id} widget={w} />

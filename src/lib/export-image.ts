@@ -2,6 +2,8 @@
 
 import type { WidgetState } from '@/components/WidgetRenderer'
 import type { PlanPhase } from '@/components/PlanProgress'
+import type { ContentBlock } from '@/lib/types'
+import { SVG_CLASS_SYSTEM } from '@/lib/build-iframe-doc'
 
 // ─── Shared ChatMessage type (for export) ────────────────────────────────────
 
@@ -10,44 +12,211 @@ export interface ExportableChatMessage {
   role: 'user' | 'assistant'
   content: string
   timestamp: number
+  // Legacy plan/phase/widget protocol
   widgets?: WidgetState[]
   planPhases?: PlanPhase[]
   thinkText?: string
   artifactComplete?: boolean
+  // Visual V2 block protocol
+  blocks?: ContentBlock[]
 }
 
 // ─── JSON Export ─────────────────────────────────────────────────────────────
 
 export function exportConversationJson(messages: ExportableChatMessage[]): void {
-  const data = {
-    exportedAt: new Date().toISOString(),
-    messageCount: messages.length,
-    messages: messages.map(m => ({
+  const exportedAt = new Date().toISOString()
+
+  const serialised = messages.map((m, idx) => {
+    const base = {
+      index: idx,
+      id: m.id,
       role: m.role,
-      content: m.content,
       timestamp: m.timestamp,
-      ...(m.widgets?.length ? {
-        artifact: {
-          widgetCount: m.widgets.length,
-          widgets: m.widgets.map(w => ({
-            id: w.id, type: w.type, title: w.title,
-            content: w.content,
-          })),
-          planPhases: m.planPhases?.map(p => ({ id: p.id, goal: p.goal, status: p.status })),
-        }
-      } : {}),
-    })),
+      timestampHuman: new Date(m.timestamp).toISOString(),
+      content: m.content || null,
+    }
+
+    // ── Visual V2 blocks ────────────────────────────────────────────────────
+    if (m.blocks?.length) {
+      return {
+        ...base,
+        protocol: 'visual-v2',
+        blocks: m.blocks.map((b, bi) => {
+          if (b.kind === 'text') {
+            return {
+              blockIndex: bi,
+              kind: 'text',
+              id: b.id,
+              isStreaming: b.isStreaming,
+              contentLength: b.content.length,
+              contentPreview: b.content.slice(0, 300) + (b.content.length > 300 ? '…' : ''),
+              // Full content for debugging
+              content: b.content,
+            }
+          }
+          return {
+            blockIndex: bi,
+            kind: 'visual',
+            id: b.id,
+            visualType: b.visualType,
+            isComplete: b.isComplete,
+            contentLength: b.content.length,
+            contentPreview: b.content.slice(0, 200) + (b.content.length > 200 ? '…' : ''),
+            // Full visual code for debugging
+            content: b.content,
+          }
+        }),
+      }
+    }
+
+    // ── Legacy plan/widget blocks ────────────────────────────────────────────
+    if (m.widgets?.length) {
+      return {
+        ...base,
+        protocol: 'legacy-widget',
+        planPhases: m.planPhases?.map(p => ({
+          id: p.id, goal: p.goal, status: p.status,
+        })),
+        widgets: m.widgets.map((w, wi) => ({
+          widgetIndex: wi,
+          id: w.id,
+          type: w.type,
+          title: w.title ?? null,
+          isStreaming: w.isStreaming,
+          partial: w.partial ?? false,
+          contentLength: w.content.length,
+          content: w.content,
+        })),
+      }
+    }
+
+    // ── Pure conversational ─────────────────────────────────────────────────
+    return {
+      ...base,
+      protocol: 'conversational',
+    }
+  })
+
+  const data = {
+    exportedAt,
+    appVersion: 'visual-v2',
+    messageCount: messages.length,
+    summary: {
+      userMessages: messages.filter(m => m.role === 'user').length,
+      assistantMessages: messages.filter(m => m.role === 'assistant').length,
+      visualV2Messages: messages.filter(m => m.blocks?.length).length,
+      legacyWidgetMessages: messages.filter(m => !m.blocks?.length && m.widgets?.length).length,
+      conversationalMessages: messages.filter(m => !m.blocks?.length && !m.widgets?.length && m.role === 'assistant').length,
+    },
+    messages: serialised,
   }
 
-  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+  const json = JSON.stringify(data, null, 2)
+  const blob = new Blob([json], { type: 'application/json' })
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
   a.href = url
-  a.download = `artifacts-conversation-${new Date().toISOString().slice(0, 10)}.json`
+  a.download = `artifacts-debug-${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.json`
   document.body.appendChild(a)
   a.click()
   document.body.removeChild(a)
   URL.revokeObjectURL(url)
+}
+
+// ─── Visual block inline renderer ────────────────────────────────────────────
+// Converts a completed visual block into a DOM element suitable for html2canvas.
+// Used by both exportConversationAsImage and exportMessageAsImage to replace
+// sandboxed iframes (which html2canvas can't capture) with equivalent inline content.
+
+function renderVisualBlock(block: ContentBlock & { kind: 'visual' }): HTMLElement {
+  const wrap = document.createElement('div')
+  wrap.style.cssText = `
+    border-radius: 10px;
+    overflow: hidden;
+    border: 0.5px solid rgba(61,57,41,0.12);
+    background: #FAFAF8;
+    margin: 2px 0;
+  `
+
+  if (block.visualType === 'svg') {
+    // Inject the SVG class system so colours render correctly
+    const style = document.createElement('style')
+    style.textContent = SVG_CLASS_SYSTEM
+    wrap.appendChild(style)
+    const inner = document.createElement('div')
+    inner.style.cssText = 'padding: 12px; display: flex; justify-content: center;'
+    inner.innerHTML = block.content
+    wrap.appendChild(inner)
+
+  } else if (block.visualType === 'html') {
+    // Strip scripts — the static markup is enough for a screenshot
+    const stripped = block.content
+      .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
+    const inner = document.createElement('div')
+    inner.style.cssText = 'padding: 0; overflow: hidden;'
+    inner.innerHTML = stripped
+    wrap.appendChild(inner)
+
+  } else {
+    // Three.js — can't be rendered statically
+    wrap.style.background = '#0f172a'
+    wrap.innerHTML = `
+      <div style="
+        padding: 32px 20px;
+        text-align: center;
+        color: #475569;
+        font-family: system-ui, sans-serif;
+        font-size: 13px;
+      ">
+        <div style="font-size:24px;margin-bottom:8px;">🌐</div>
+        3D 场景（仅在交互模式下可用）
+      </div>`
+  }
+
+  return wrap
+}
+
+/** Collect all complete visual blocks from a flat array of content blocks */
+function visualBlocksFromBlocks(blocks: ContentBlock[]): Array<ContentBlock & { kind: 'visual' }> {
+  return blocks.filter((b): b is ContentBlock & { kind: 'visual' } =>
+    b.kind === 'visual' && b.isComplete
+  )
+}
+
+/** Collect all complete visual blocks across multiple messages */
+function visualBlocksFromMessages(messages: ExportableChatMessage[]): Array<ContentBlock & { kind: 'visual' }> {
+  return messages.flatMap(m => visualBlocksFromBlocks(m.blocks ?? []))
+}
+
+/**
+ * Replace every <iframe> in a cloned element with an inline visual block.
+ * `visualBlocks` must be ordered the same way the iframes appear in the DOM.
+ */
+function inlineVisuals(clone: HTMLElement, visualBlocks: Array<ContentBlock & { kind: 'visual' }>) {
+  const iframes = Array.from(clone.querySelectorAll('iframe'))
+  iframes.forEach((iframe, i) => {
+    const block = visualBlocks[i]
+    let replacement: HTMLElement
+    if (block) {
+      replacement = renderVisualBlock(block)
+    } else {
+      replacement = document.createElement('div')
+      replacement.style.cssText = `
+        padding: 12px 16px;
+        border-radius: 8px;
+        border: 0.5px solid rgba(61,57,41,0.1);
+        background: #F0EEE6;
+        color: #83827D;
+        font-family: system-ui, sans-serif;
+        font-size: 12px;
+      `
+      replacement.textContent = '交互组件（无法在截图中显示）'
+    }
+    // Match the iframe's rendered height if possible
+    const h = (iframe as HTMLIFrameElement).style.height || iframe.getAttribute('height')
+    if (h) replacement.style.minHeight = h
+    iframe.parentNode?.replaceChild(replacement, iframe)
+  })
 }
 
 // ─── Shared canvas helpers ────────────────────────────────────────────────────
@@ -81,7 +250,10 @@ async function captureElement(el: HTMLElement): Promise<HTMLCanvasElement> {
 
 // ─── Conversation image export ────────────────────────────────────────────────
 
-export async function exportConversationAsImage(messagesRoot: HTMLElement): Promise<void> {
+export async function exportConversationAsImage(
+  messagesRoot: HTMLElement,
+  messages: ExportableChatMessage[],
+): Promise<void> {
   const bgColor = getVar('--bg-primary', '#262624')
 
   const container = document.createElement('div')
@@ -106,27 +278,9 @@ export async function exportConversationAsImage(messagesRoot: HTMLElement): Prom
   `
   container.appendChild(header)
 
-  // Clone messages
+  // Clone messages and inline visuals from block data
   const clone = messagesRoot.cloneNode(true) as HTMLElement
-  // Replace iframes with their content
-  const iframes = Array.from(clone.querySelectorAll('iframe'))
-  const origIframes = Array.from(messagesRoot.querySelectorAll('iframe')) as HTMLIFrameElement[]
-  iframes.forEach((ifrm, i) => {
-    const orig = origIframes[i]
-    const div = document.createElement('div')
-    div.style.cssText = `border-radius:8px;overflow:hidden;border:0.5px solid ${getVar('--border-default','rgba(245,244,238,0.1)')};background:${getVar('--bg-tertiary','#30302E')};padding:16px;`
-    try {
-      const content = orig?.contentDocument?.body?.innerHTML
-      if (content) {
-        div.innerHTML = content.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
-      } else {
-        div.innerHTML = `<div style="color:${getVar('--text-tertiary','#83827D')};font-size:12px;padding:8px;">交互组件（截图不可用）</div>`
-      }
-    } catch {
-      div.innerHTML = `<div style="color:${getVar('--text-tertiary','#83827D')};font-size:12px;padding:8px;">交互组件（截图不可用）</div>`
-    }
-    ifrm.parentNode?.replaceChild(div, ifrm)
-  })
+  inlineVisuals(clone, visualBlocksFromMessages(messages))
   container.appendChild(clone)
 
   document.body.appendChild(container)
@@ -142,8 +296,9 @@ export async function exportConversationAsImage(messagesRoot: HTMLElement): Prom
 
 export async function exportMessageAsImage(
   msgElement: HTMLElement,
-  origMsgElement: HTMLElement,
+  _origMsgElement: HTMLElement,
   label?: string,
+  blocks?: ContentBlock[],
 ): Promise<void> {
   const bgColor = getVar('--bg-primary', '#262624')
 
@@ -167,25 +322,7 @@ export async function exportMessageAsImage(
   }
 
   const clone = msgElement.cloneNode(true) as HTMLElement
-  // Fix iframes
-  const iframes = Array.from(clone.querySelectorAll('iframe'))
-  const origIframes = Array.from(origMsgElement.querySelectorAll('iframe')) as HTMLIFrameElement[]
-  iframes.forEach((ifrm, i) => {
-    const orig = origIframes[i]
-    const div = document.createElement('div')
-    div.style.cssText = `border-radius:8px;overflow:hidden;border:0.5px solid ${getVar('--border-default','rgba(245,244,238,0.1)')};background:${getVar('--bg-tertiary','#30302E')};padding:16px;`
-    try {
-      const content = orig?.contentDocument?.body?.innerHTML
-      if (content) {
-        div.innerHTML = content.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
-      } else {
-        div.innerHTML = `<div style="color:${getVar('--text-tertiary','#83827D')};font-size:12px;">交互组件（截图不可用）</div>`
-      }
-    } catch {
-      div.innerHTML = `<div style="color:${getVar('--text-tertiary','#83827D')};font-size:12px;">交互组件（截图不可用）</div>`
-    }
-    ifrm.parentNode?.replaceChild(div, ifrm)
-  })
+  inlineVisuals(clone, visualBlocksFromBlocks(blocks ?? []))
   container.appendChild(clone)
 
   document.body.appendChild(container)

@@ -5,10 +5,18 @@
 
 import OpenAI from 'openai'
 
-const client = new OpenAI({
-  apiKey: process.env.ARTIFACTS_LLM_API_KEY,
-  baseURL: process.env.ARTIFACTS_LLM_BASE_URL,
-})
+// Lazily created so the module can be imported at build time without
+// ARTIFACTS_LLM_API_KEY being present (Vercel build env has no .env.local).
+let _client: OpenAI | null = null
+function getClient(): OpenAI {
+  if (!_client) {
+    _client = new OpenAI({
+      apiKey: process.env.ARTIFACTS_LLM_API_KEY ?? 'missing-key',
+      baseURL: process.env.ARTIFACTS_LLM_BASE_URL,
+    })
+  }
+  return _client
+}
 
 export const MODEL = process.env.ARTIFACTS_LLM_MODEL || 'gpt-4o-mini'
 
@@ -31,7 +39,7 @@ export interface StreamCallOptions {
 export async function streamCall(opts: StreamCallOptions): Promise<string> {
   const { messages, maxTokens = 8000, temperature = 0.7, signal, onChunk } = opts
 
-  const stream = await client.chat.completions.create({
+  const stream = await getClient().chat.completions.create({
     model: MODEL,
     messages,
     max_tokens: maxTokens,
@@ -55,7 +63,7 @@ export async function streamCall(opts: StreamCallOptions): Promise<string> {
  * 非流式短调用（用于 Critic）
  */
 export async function callOnce(messages: Message[], maxTokens = 200): Promise<string> {
-  const res = await client.chat.completions.create({
+  const res = await getClient().chat.completions.create({
     model: MODEL,
     messages,
     max_tokens: maxTokens,
@@ -63,4 +71,34 @@ export async function callOnce(messages: Message[], maxTokens = 200): Promise<st
     stream: false,
   })
   return res.choices[0]?.message?.content ?? ''
+}
+
+/**
+ * 结构化调用 — JSON mode + Zod 验证
+ */
+export async function callStructured<T extends import('zod').ZodTypeAny>(
+  messages: Message[],
+  schema: T,
+  opts: { system?: string; maxTokens?: number; fallback?: import('zod').infer<T> } = {},
+): Promise<import('zod').infer<T>> {
+  const { system, maxTokens = 200, fallback } = opts
+  const allMessages: Message[] = system
+    ? [{ role: 'system', content: system + '\nRespond with a valid JSON object only.' }, ...messages]
+    : messages
+
+  let raw = ''
+  try {
+    raw = await callOnce(allMessages, maxTokens)
+  } catch { if (fallback !== undefined) return fallback; throw new Error('callStructured failed') }
+
+  let parsed: unknown
+  try { parsed = JSON.parse(raw.trim()) } catch {
+    const m = raw.match(/\{[\s\S]*\}/)
+    try { parsed = m ? JSON.parse(m[0]) : {} } catch { parsed = {} }
+  }
+
+  const result = schema.safeParse(parsed)
+  if (result.success) return result.data
+  if (fallback !== undefined) return fallback
+  throw new Error(`Schema validation failed: ${result.error.message}`)
 }
