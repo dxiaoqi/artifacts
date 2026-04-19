@@ -126,9 +126,14 @@ export async function runVisualOrchestrator(opts: VisualOrchestratorOptions) {
   // ── 2. Build system prompt ───────────────────────────────────────────────
   emit('status', { message: '正在生成…' })
 
-  const systemPrompt = buildVisualSystemPrompt() + (artifactsDefaultEnabled
-    ? '\n\n[CONFIG] Always generate visual content using <text>/<visual> protocol. Never output plain text only.'
-    : '')
+  const artifactHint = artifactsDefaultEnabled
+    ? '\n\n[STRICT OUTPUT RULE]\n' +
+      '- ALL interactive components, calculators, charts, diagrams MUST use <visual type="html"> or <visual type="svg">.\n' +
+      '- NEVER wrap HTML/SVG code in markdown fences (```html). Use <visual type="html"> ONLY.\n' +
+      '- NEVER output "Here is the code:" followed by a code block. Render it directly.\n' +
+      '- If the user asks to build/create/show something interactive, output <visual type="html"> immediately.'
+    : ''
+  const systemPrompt = buildVisualSystemPrompt() + artifactHint
 
   const messages: Message[] = [
     { role: 'system', content: systemPrompt },
@@ -206,15 +211,43 @@ export async function runVisualOrchestrator(opts: VisualOrchestratorOptions) {
 
   parser.end()
 
-  // ── 4. Safety net: if no blocks produced, degrade to conversational ──────
+  // ── 4. Safety net ────────────────────────────────────────────────────────
   if (!hasAnyBlock && fullResponse.trim()) {
-    const clean = fullResponse
-      .replace(/<think[\s\S]*?<\/think>/gi, '')
-      .replace(/<[^>]+>/g, '')
-      .replace(/\n{3,}/g, '\n\n')
-      .trim()
-    emit('conversational.reply', { text: clean || '…', done: false })
-    emit('conversational.reply', { text: '', done: true })
+    // Before degrading: check if the model output markdown fenced code blocks
+    // (```html / ```svg / ```javascript) instead of <visual> tags.
+    // Extract the first fenced block and emit it as a visual so the user
+    // still sees a rendered result rather than raw code text.
+    const fenceMatch = fullResponse.match(/```(html?|svg|javascript|js|threejs)\s*\n([\s\S]*?)(?:```|$)/i)
+    if (fenceMatch) {
+      const lang = fenceMatch[1].toLowerCase()
+      const code = fenceMatch[2].trim()
+      const visualType = (lang === 'svg') ? 'svg'
+        : (lang === 'threejs') ? 'threejs'
+        : 'html'
+
+      // Emit any preamble text before the fence
+      const preamble = fullResponse.slice(0, fullResponse.indexOf('```')).trim()
+      if (preamble) {
+        emit('block.text_start', { blockId: 'b0' })
+        emit('block.text_chunk', { text: preamble })
+        emit('block.text_end', {})
+      }
+
+      // Emit the code block as a visual
+      blockCounter++
+      emit('block.visual_start', { blockId: `b${blockCounter}`, visualType })
+      emit('block.visual', { blockId: `b${blockCounter}`, visualType, content: code })
+      emit('stream.completed', { artifactId })
+    } else {
+      // No recoverable code block found — degrade to conversational text
+      const clean = fullResponse
+        .replace(/<think[\s\S]*?<\/think>/gi, '')
+        .replace(/<[^>]+>/g, '')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim()
+      emit('conversational.reply', { text: clean || '…', done: false })
+      emit('conversational.reply', { text: '', done: true })
+    }
   } else {
     emit('stream.completed', { artifactId })
   }
